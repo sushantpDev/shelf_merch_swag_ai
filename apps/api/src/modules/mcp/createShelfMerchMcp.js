@@ -22,6 +22,14 @@ import {
   listCatalogCategories,
 } from './catalogRead.js';
 import {
+  PRODUCTS_GET_DESIGN_OPTIONS_DESCRIPTION,
+  getProductDesignOptions,
+  productDesignOptionsError,
+  productDesignOptionsInputSchema,
+  productDesignOptionsOutputSchema,
+  productDesignOptionsText,
+} from './productDesignOptions.js';
+import {
   CATALOG_PRODUCT_CARD_MIME,
   CATALOG_PRODUCT_CARD_URI,
   catalogProductCardResourceMeta,
@@ -532,6 +540,40 @@ export const shelfMerchMcpHandler = createMcpHandler(
           return {
             isError: true,
             content: [{ type: 'text', text: 'Product lookup failed.' }],
+          };
+        }
+      },
+    );
+    server.registerTool(
+      'products_get_design_options',
+      {
+        title: 'Get product design options',
+        description: PRODUCTS_GET_DESIGN_OPTIONS_DESCRIPTION,
+        inputSchema: productDesignOptionsInputSchema,
+        outputSchema: productDesignOptionsOutputSchema,
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+        scopeChallenge: requireScopes('catalog:read'),
+        _meta: {
+          securitySchemes: [{ type: 'oauth2', scopes: ['catalog:read'] }],
+        },
+      },
+      async (args) => {
+        try {
+          const output = await getProductDesignOptions(args.productId);
+          return {
+            content: [{ type: 'text', text: productDesignOptionsText(output) }],
+            structuredContent: output,
+          };
+        } catch (err) {
+          logger.error({ errName: err?.name, errCode: err?.code }, 'MCP products_get_design_options failed');
+          return {
+            isError: true,
+            content: [{ type: 'text', text: productDesignOptionsError(err, 'Product design options failed.') }],
           };
         }
       },

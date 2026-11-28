@@ -2,8 +2,13 @@
 // Calls the exact mapper, Add Artwork default selector and Save Design baker.
 import { mapCatalogProduct, type UiProduct } from "@/services/mappers";
 import { preferredDefaultAreaKey } from "./wizard/artworkStepModel";
-import { areaPlacementKey, designImgUrl, designImgUrlForView, pickPrintArea, printAreaViewKey, resolvePrintAreaStage, loadImageEl } from "./mockup-bake";
+import { areaPlacementKey, bakeMockup, defaultPlacement, designImgUrl, designImgUrlForView, exportDesignOnly, pickPrintArea, printAreaViewKey, resolvePrintAreaStage, loadImageEl, type Placement } from "./mockup-bake";
 import { bakeCollectionDesignMockups } from "./bakeCollectionDesign";
+
+type RenderRequest = {
+  areaKey?: string;
+  placement?: Placement;
+};
 
 type Raw = Parameters<typeof mapCatalogProduct>[0];
 export function inspect(products: Raw[]) {
@@ -30,7 +35,67 @@ export function inspect(products: Raw[]) {
   });
 }
 
-export async function render(productRaw: Raw, artwork: string, assets: Record<string, string>) {
+function applyVerifiedAssets(product: UiProduct, assets: Record<string, string>) {
+  for (const key of ['photoUrl', 'imgUrl', 'maskImageUrl', 'baseImageUrl', 'maskBackImageUrl', 'baseBackImageUrl',
+    'maskLeftImageUrl', 'baseLeftImageUrl', 'maskRightImageUrl', 'baseRightImageUrl'] as const) {
+    if (product[key]) product[key] = assets[product[key]!] || undefined;
+  }
+  product.imageUrls = product.imageUrls?.map(url => assets[url]).filter(Boolean);
+  product.printAreas = product.printAreas?.map(area => ({ ...area, mockupImageUrl: area.mockupImageUrl ? assets[area.mockupImageUrl] : undefined }));
+}
+
+/** Bake one requested decoration area at the caller's placement. Chest left/right use the front photo unless a side image exists. */
+export async function renderPlaced(productRaw: Raw, artwork: string, assets: Record<string, string>, request: RenderRequest = {}) {
+  const product = mapCatalogProduct(productRaw);
+  applyVerifiedAssets(product, assets);
+  const areaKey = request.areaKey || preferredDefaultAreaKey(product);
+  const area = pickPrintArea(product, areaKey);
+  const stage = resolvePrintAreaStage(product, {}, areaKey);
+  const rawArea = productRaw.printAreas?.find((row: Record<string, unknown>, index: number) => {
+    const key = String(row?.key || '').trim();
+    return key === area?.key || key === areaKey || `${key}__${index}` === areaKey;
+  });
+  const image = designImgUrl(product, areaKey);
+  const frame = stage.phys;
+  const pixels = Number(area?.widthIn) * Number(area?.heightIn) * (Number(area?.dpi || product.dpi) || 300) ** 2;
+  const supported = Boolean(area && area.widthIn! > 0 && area.heightIn! > 0 && image
+    && Number.isFinite(area.xIn) && Number.isFinite(area.yIn) && pixels > 0 && pixels <= 16_000_000
+    && area.xIn! >= 0 && area.yIn! >= 0 && area.xIn! + area.widthIn! <= frame.width
+    && area.yIn! + area.heightIn! <= frame.height
+    && rawArea?.shapeType !== 'polygon');
+  if (!supported) throw new Error('This decoration area needs a rectangular print region and a product image.');
+  const placement = request.placement?.printWPct ? request.placement : defaultPlacement(product, 1, areaKey);
+  const images = await Promise.all([loadImageEl(artwork), loadImageEl(image)]);
+  if (images.some(image => image.naturalWidth * image.naturalHeight > 16_000_000)) throw new Error('Image exceeds rendering limit');
+  const [dataUrl, design] = await Promise.all([
+    bakeMockup(product as UiProduct, artwork, placement, 1000, true, areaKey),
+    exportDesignOnly(product as UiProduct, artwork, placement, areaKey),
+  ]);
+  if (!dataUrl?.startsWith('data:image/png') || !design.dataUrl?.startsWith('data:image/png')) {
+    throw new Error('Incomplete saved design output');
+  }
+  return {
+    catalogProductId: product.id,
+    dataUrl,
+    designOnlyDataUrl: design.dataUrl,
+    printSpec: { widthIn: design.widthIn, heightIn: design.heightIn, dpi: design.dpi, widthPx: design.widthPx, heightPx: design.heightPx },
+    placement,
+    placements: [{ key: areaKey, ...placement }],
+    target: {
+      productId: product.id!,
+      name: product.nm,
+      areaKey,
+      areaLabel: area?.label || areaKey,
+      view: printAreaViewKey(product, area),
+      baseUrl: designImgUrlForView(product, printAreaViewKey(product, area)) || image,
+      supported: true,
+      reason: null,
+    },
+  };
+}
+
+export async function render(productRaw: Raw, artwork: string, assets: Record<string, string>, request?: RenderRequest) {
+  if (request?.areaKey || request?.placement) return renderPlaced(productRaw, artwork, assets, request);
   const [target] = inspect([productRaw]);
   if (!target.supported) throw new Error(target.reason!);
   const product = mapCatalogProduct(productRaw);

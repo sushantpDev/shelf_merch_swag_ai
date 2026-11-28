@@ -8,10 +8,14 @@ import { Shop } from '../shops/shop.model.js';
 import { Collection } from '../collections/collection.model.js';
 import { CatalogProduct } from '../catalog/catalogProduct.model.js';
 import { isCollectionLinkedToShop } from '../collections/collectionQueries.js';
+import { readProductImage, renderingProducts } from '../copilot/swagArtwork.service.js';
+import * as swagRenderer from '../copilot/swagRenderer.service.js';
+import { uploadBuffer } from '../../services/storage.service.js';
 import { employeeReaderFromContext } from './employeesRead.js';
 import { executeMcpWrite, loadMcpActor, prepareMcpWrite } from './mcpWriteSafety.js';
 import { McpCollectionClaim } from './mcpCollectionClaim.model.js';
 import { McpShopAssetTicket } from './mcpShopAssetTicket.model.js';
+import { listDesignAreas } from './productDesignOptions.js';
 import {
   createPendingAssetTicket,
   getShopAssetUpload,
@@ -65,10 +69,11 @@ export const PRODUCT_ARTWORK_GET_UPLOAD_DESCRIPTION = [
 
 export const PRODUCT_ARTWORK_PREPARE_DESIGN_DESCRIPTION = [
   'Preview applying an uploaded product artwork to one catalog product and decoration area.',
+  'Call products_get_design_options first and copy decorationArea and defaultPlacement from that response. Do not guess a key such as front.',
   'Requires a ready artworkTicketId from products_get_artwork_upload. An arbitrary image URL is not accepted.',
   'Checks the product, optional variant, decoration area, and placement. The artwork must stay inside the decoration area.',
-  'Returns a placement preview. This tool does not bake a mockup image and does not save or publish a collection.',
-  'Saving requires products_execute_design with the confirmation id.',
+  'A mockupUrl is returned only when the ShelfMerch renderer produced an image for this area and placement. Otherwise bakedMockup is false.',
+  'This tool does not save or publish a collection. Saving requires products_execute_design with the confirmation id.',
 ].join(' ');
 
 export const PRODUCT_ARTWORK_EXECUTE_DESIGN_DESCRIPTION = [
@@ -120,7 +125,8 @@ const previewOut = z.object({
   decorationArea: z.object({ key: z.string(), label: z.string() }),
   placement: placementOut,
   variant: z.object({ sku: z.string(), color: z.string(), size: z.string() }).nullable(),
-  bakedMockup: z.literal(false),
+  bakedMockup: z.boolean(),
+  mockupUrl: z.string().optional(),
 });
 
 export const productArtworkPrepareDesignInputSchema = designSchema;
@@ -208,12 +214,109 @@ function checkedPlacement(placement) {
 }
 
 function matchArea(product, wanted) {
-  const areas = product.printAreas || [];
-  const matches = areas.filter((area) => area.key === wanted || sameText(area.label, wanted));
+  const areas = listDesignAreas(product);
+  if (!areas.length) {
+    throw new ApiError(422, 'This product has no decoration areas. Call products_get_design_options.', 'DECORATION_AREA_INVALID');
+  }
+  const exact = areas.filter((area) => area.key === wanted);
+  const byLabel = areas.filter((area) => sameText(area.label, wanted));
+  const matches = exact.length ? exact : byLabel;
   if (matches.length !== 1) {
-    throw new ApiError(422, 'That decoration area is not on this product', 'DECORATION_AREA_INVALID');
+    const keys = areas.map((area) => area.key).join(', ');
+    throw new ApiError(
+      422,
+      `That decoration area is not on this product. Call products_get_design_options and use one of: ${keys}`,
+      'DECORATION_AREA_INVALID',
+    );
   }
   return matches[0];
+}
+
+function pngFromDataUrl(dataUrl) {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png;base64,')) return null;
+  const buffer = Buffer.from(dataUrl.slice('data:image/png;base64,'.length), 'base64');
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (buffer.length < signature.length || !buffer.subarray(0, 8).equals(signature)) return null;
+  return buffer;
+}
+
+async function renderAppliedMockup({ tenantId, product, area, artworkUrl, placement }) {
+  const empty = { bakedMockup: false, mockupUrl: '', designOnlyImageUrl: '' };
+  if (!area?.rendererCompatible || !placement?.printWPct || !swagRenderer.rendererConfigured()) {
+    return empty;
+  }
+  try {
+    const artwork = await readProductImage(artworkUrl);
+    if (artwork.type !== 'png') return empty;
+    const urls = [
+      product.primaryImageUrl,
+      product.baseImageUrl,
+      product.maskImageUrl,
+      product.baseBackImageUrl,
+      product.maskBackImageUrl,
+      product.baseLeftImageUrl,
+      product.maskLeftImageUrl,
+      product.baseRightImageUrl,
+      product.maskRightImageUrl,
+      ...(product.imageUrls || []),
+      ...((product.printAreas || []).map((entry) => entry?.mockupImageUrl)),
+    ].filter((url) => typeof url === 'string' && url.trim());
+    const assets = {};
+    for (const url of [...new Set(urls)]) {
+      try {
+        const image = await readProductImage(url);
+        assets[url] = `data:image/${image.type};base64,${image.bytes.toString('base64')}`;
+      } catch {
+        // The renderer ignores images it cannot read. A missing asset means no mockup.
+      }
+    }
+    if (!Object.keys(assets).length) return empty;
+    const raw = renderingProducts([product])[0];
+    const result = await swagRenderer.withSwagRenderer((renderer) => renderer.evaluate('render', [
+      raw,
+      `data:image/png;base64,${artwork.bytes.toString('base64')}`,
+      assets,
+      {
+        areaKey: area.key,
+        placement: {
+          printCxPct: placement.printCxPct,
+          printCyPct: placement.printCyPct,
+          printWPct: placement.printWPct,
+          xPct: placement.xPct,
+          yPct: placement.yPct,
+          wPct: placement.wPct,
+          rot: placement.rot,
+        },
+      },
+    ]));
+    const png = pngFromDataUrl(result?.dataUrl);
+    if (!png) return empty;
+    const stored = await uploadBuffer({
+      tenantId,
+      kind: 'mockup',
+      buffer: png,
+      filename: 'design-preview.png',
+      contentType: 'image/png',
+    });
+    if (!stored?.url) return empty;
+    const designPng = pngFromDataUrl(result?.designOnlyDataUrl);
+    const designOnly = designPng
+      ? await uploadBuffer({
+        tenantId,
+        kind: 'production',
+        buffer: designPng,
+        filename: 'design-only.png',
+        contentType: 'image/png',
+      })
+      : null;
+    return {
+      bakedMockup: true,
+      mockupUrl: stored.url,
+      designOnlyImageUrl: designOnly?.url || '',
+    };
+  } catch {
+    return empty;
+  }
 }
 
 function matchVariant(product, selector) {
@@ -343,22 +446,35 @@ async function findSavedDesign(tenantId, input, resolved) {
     if (!ref || String(ref.catalogProductId) !== String(input.catalogProductId)) return false;
     const areaKey = resolved.area.key || resolved.area.label || '';
     const placed = (ref.placements || []).find((entry) => entry.artworkUrl === resolved.artworkUrl && entry.key === areaKey);
-    return Boolean(placed) && samePlacement(placed, resolved.placement);
+    const storedVariant = ref.selectedVariant || {};
+    const sameVariant = (storedVariant.sku || '') === (resolved.variant?.sku || '')
+      && sameText(storedVariant.color, resolved.variant?.color)
+      && sameText(storedVariant.size, resolved.variant?.size);
+    return Boolean(placed) && samePlacement(placed, resolved.placement) && sameVariant;
   }) || null;
 }
 
-function previewBody(resolved) {
+function mockupFields(mockup) {
+  if (mockup?.bakedMockup && mockup.mockupUrl) {
+    return { bakedMockup: true, mockupUrl: mockup.mockupUrl };
+  }
+  return { bakedMockup: false };
+}
+
+function previewBody(resolved, mockup) {
+  const storedUrl = resolved.savedMockupUrl || '';
   return {
     artworkUrl: resolved.artworkUrl,
     productImageUrl: resolved.productImageUrl,
     decorationArea: areaOut(resolved.area),
     placement: resolved.placement,
     variant: variantOut(resolved.variant),
-    bakedMockup: false,
+    ...mockupFields(storedUrl ? { bakedMockup: true, mockupUrl: storedUrl } : mockup),
   };
 }
 
-function presentSaved(collection, resolved) {
+function presentSaved(collection, resolved, mockup) {
+  const storedUrl = collection?.productRefs?.[0]?.mockupUrl || '';
   return {
     id: String(collection._id),
     name: collection.name,
@@ -366,7 +482,7 @@ function presentSaved(collection, resolved) {
     shopId: String(resolved.shop._id),
     catalogProductId: String(resolved.product._id),
     published: isCollectionLinkedToShop(collection, resolved.shop._id),
-    ...previewBody(resolved),
+    ...previewBody({ ...resolved, savedMockupUrl: storedUrl }, mockup),
   };
 }
 
@@ -406,7 +522,14 @@ async function saveDesign(actor, input) {
     }
     if (linked) throw new ApiError(409, 'A collection with this name already exists', 'COLLECTION_EXISTS');
   }
-  const areaKey = resolved.area.key || resolved.area.label || 'area_1';
+  const areaKey = resolved.area.key || 'area_1';
+  const mockup = await renderAppliedMockup({
+    tenantId,
+    product: resolved.product,
+    area: resolved.area,
+    artworkUrl: resolved.artworkUrl,
+    placement: resolved.placement,
+  });
   const collection = await Collection.create({
     tenantId,
     shopId: null,
@@ -422,7 +545,14 @@ async function saveDesign(actor, input) {
       name: resolved.product.name,
       group: resolved.product.group || '',
       inheritArtwork: false,
-      mockupUrl: '',
+      mockupUrl: mockup.mockupUrl || '',
+      designOnlyImageUrl: mockup.designOnlyImageUrl || '',
+      selectedVariant: resolved.variant ? {
+        sku: resolved.variant.sku || '',
+        color: resolved.variant.color || '',
+        size: resolved.variant.size || '',
+        colorHex: resolved.variant.colorHex || '',
+      } : undefined,
       placement: resolved.placement,
       placements: [{ key: areaKey, ...resolved.placement, artworkUrl: resolved.artworkUrl }],
     }],
@@ -476,6 +606,7 @@ export async function prepareProductArtworkUpload({ tenantId, actorUserId, input
       'ChatGPT cannot forward an attached file to ShelfMerch. Do not paste the image into chat.',
       'Allowed file: PNG, at least 300 DPI on both axes, maximum 5 MB.',
       'When the browser page shows success, call products_get_artwork_upload with this ticketId.',
+      'Then call products_get_design_options and copy a decoration area key. Do not guess front.',
       'Then call products_prepare_design. The design is not saved until products_execute_design.',
     ].join(' '),
   };
@@ -503,6 +634,13 @@ export async function prepareProductArtworkDesign({ tenantId, actorUserId, input
       assertAdmin(actor);
       planned.resolved = await resolveDesign(tenantId, actorUserId, requested.data);
       planned.existing = await findSavedDesign(tenantId, requested.data, planned.resolved);
+      planned.mockup = await renderAppliedMockup({
+        tenantId,
+        product: planned.resolved.product,
+        area: planned.resolved.area,
+        artworkUrl: planned.resolved.artworkUrl,
+        placement: planned.resolved.placement,
+      });
     },
     validate: async () => requested.data,
     resourceState: async () => designSnapshotFrom(
@@ -520,7 +658,7 @@ export async function prepareProductArtworkDesign({ tenantId, actorUserId, input
       catalogProductId: String(planned.resolved.product._id),
       status: 'draft',
       published: false,
-      ...previewBody(planned.resolved),
+      ...previewBody(planned.resolved, planned.mockup),
     },
   };
 }
@@ -608,12 +746,16 @@ export function productArtworkText(output, heading) {
     ].join('\n');
   }
   if (output.preview) {
+    const mockupLine = output.preview.bakedMockup && output.preview.mockupUrl
+      ? `Preview image ${output.preview.mockupUrl}`
+      : 'No mockup image was baked.';
     return [
       heading,
       `${output.preview.name} stays a draft`,
       `Artwork ${output.preview.artworkUrl}`,
-      `Area ${output.preview.decorationArea.label}`,
-      'No mockup image was baked. Confirm this preview before it expires.',
+      `Area ${output.preview.decorationArea.key}`,
+      mockupLine,
+      'Confirm this preview before it expires.',
     ].join('\n');
   }
   if (output.status && !output.id) {
@@ -623,7 +765,8 @@ export function productArtworkText(output, heading) {
     heading,
     `${output.name} is a draft and is not published`,
     `Artwork ${output.artworkUrl}`,
-    `Area ${output.decorationArea?.label || ''}`,
+    `Area ${output.decorationArea?.key || ''}`,
+    output.bakedMockup && output.mockupUrl ? `Preview image ${output.mockupUrl}` : 'No mockup image was baked.',
   ].join('\n');
 }
 
@@ -650,5 +793,6 @@ const WRITE_ERRORS = {
 };
 
 export function productArtworkError(error, fallback) {
+  if (error?.code === 'DECORATION_AREA_INVALID' && error.message) return error.message;
   return WRITE_ERRORS[error?.code] || fallback;
 }

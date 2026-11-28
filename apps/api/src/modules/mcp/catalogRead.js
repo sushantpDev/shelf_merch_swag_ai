@@ -18,6 +18,7 @@ export const CATALOG_GET_PRODUCT_DESCRIPTION = [
   'Do not invent prices, variants, or stock.',
   'This product is ShelfMerch inventory. Anything not returned here is not available to order and, if offered as a general gift idea, must be labeled inspiration.',
   'Cost, margin, supplier, vendor, source identifiers, customization costs, and production-mask assets are not returned.',
+  'Decoration areas are not included. Call products_get_design_options and copy a returned key. Do not guess front.',
 ].join(' ');
 
 export const catalogGetProductInputSchema = z.object({

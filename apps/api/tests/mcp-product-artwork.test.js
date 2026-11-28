@@ -1,4 +1,4 @@
-import { beforeAll, afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { beforeAll, afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +17,8 @@ import {
   prepareProductArtworkDesign,
   prepareProductArtworkUpload,
 } from '../src/modules/mcp/productArtworkWrite.js';
+import { getProductDesignOptions } from '../src/modules/mcp/productDesignOptions.js';
+import * as swagRenderer from '../src/modules/copilot/swagRenderer.service.js';
 import { COPILOT_MCP_TOOL_NAMES } from '../src/modules/copilot/copilotMcpCatalog.js';
 import { clearTenantLimitCache } from '../src/services/tenantGuardrails.service.js';
 import { makeTenant, makeUser } from './helpers.js';
@@ -156,6 +158,7 @@ describe('product artwork MCP', () => {
       'products_get_artwork_upload',
       'products_prepare_design',
       'products_execute_design',
+      'products_get_design_options',
     ]) {
       expect(COPILOT_MCP_TOOL_NAMES).not.toContain(name);
     }
@@ -414,6 +417,11 @@ describe('product artwork MCP', () => {
       artworkUrl: completed.assetUrl,
       printWPct: 30,
     });
+    expect(stored.productRefs[0].selectedVariant).toMatchObject({
+      sku: 'MUG-NAVY-M',
+      color: 'Navy',
+      size: 'M',
+    });
 
     const onDisk = await fs.readFile(path.join(apiRoot, completed.assetUrl.replace(/^\//, '')));
     expect(Buffer.compare(onDisk, ARTWORK_PNG)).toBe(0);
@@ -450,5 +458,277 @@ describe('product artwork MCP', () => {
       idempotencyKey: 'art-save-2',
     })).rejects.toMatchObject({ code: 'COLLECTION_EXISTS' });
     expect(await Collection.countDocuments({ tenantId: tenant._id })).toBe(1);
+  });
+
+  it('uses ActiveDry Polo decoration keys and keeps another product on its own area', async () => {
+    const polo = await CatalogProduct.create({
+      sku: `POLO-${Date.now()}`,
+      name: 'ActiveDry Polo',
+      category: 'Apparel',
+      group: 'polo',
+      basePriceInr: 840,
+      primaryImageUrl: 'https://cdn.test/polo.png',
+      physicalDimensions: { width: 20, height: 26, length: 18 },
+      printAreas: [
+        { key: 'right', label: 'Right', xIn: 2, yIn: 4, widthIn: 3.5, heightIn: 3.5 },
+        { key: 'left', label: 'Left', xIn: 14, yIn: 4, widthIn: 3.5, heightIn: 3.5 },
+        { key: 'back', label: 'Back', xIn: 6, yIn: 5, widthIn: 8, heightIn: 10 },
+      ],
+      variants: [{ sku: 'POLO-BLK-L', color: 'Black', colorHex: '#111111', size: 'L', enabled: true }],
+    });
+    const mug = await CatalogProduct.create({
+      sku: `WRAP-${Date.now()}`,
+      name: 'Camp Mug',
+      category: 'Drinkware',
+      group: 'mug',
+      basePriceInr: 300,
+      primaryImageUrl: 'https://cdn.test/mug.png',
+      physicalDimensions: { width: 12, height: 10, length: 12 },
+      printAreas: [{ key: 'wrap', label: 'Wrap', xIn: 1, yIn: 2, widthIn: 8, heightIn: 3 }],
+      variants: [{ sku: 'MUG-WHT', color: 'White', colorHex: '#ffffff', size: 'OS', enabled: true }],
+    });
+    const split = await CatalogProduct.create({
+      sku: `TEE-${Date.now()}`,
+      name: 'Split Tee',
+      category: 'Apparel',
+      group: 'tee',
+      basePriceInr: 500,
+      primaryImageUrl: 'https://cdn.test/tee.png',
+      physicalDimensions: { width: 20, height: 24, length: 18 },
+      printAreas: [
+        { key: 'front', label: 'Chest', xIn: 7, yIn: 6, widthIn: 4, heightIn: 4 },
+        { key: 'front', label: 'Hem', xIn: 7, yIn: 16, widthIn: 4, heightIn: 2 },
+      ],
+    });
+
+    const poloOptions = await getProductDesignOptions(String(polo._id));
+    expect(poloOptions.decorationAreas.map((area) => area.key)).toEqual(['right', 'left', 'back']);
+    expect(poloOptions.defaultDecorationArea).toBe('left');
+    expect(poloOptions.decorationAreas.find((area) => area.key === 'left')).toMatchObject({
+      label: 'Left',
+      view: 'left',
+      isDefault: true,
+      rendererCompatible: true,
+      imageUrl: 'https://cdn.test/polo.png',
+      widthIn: 3.5,
+      heightIn: 3.5,
+    });
+    expect(poloOptions.images).toContain('https://cdn.test/polo.png');
+    expect(poloOptions.variants).toEqual([
+      { sku: 'POLO-BLK-L', color: 'Black', colorHex: '#111111', size: 'L' },
+    ]);
+    expect(poloOptions.decorationAreas.every((area) => area.rendererCompatible === true)).toBe(true);
+
+    const mugOptions = await getProductDesignOptions(String(mug._id));
+    expect(mugOptions.decorationAreas.map((area) => area.key)).toEqual(['wrap']);
+    expect(mugOptions.defaultDecorationArea).toBe('wrap');
+
+    const splitOptions = await getProductDesignOptions(String(split._id));
+    expect(splitOptions.decorationAreas.map((area) => area.key)).toEqual(['front', 'front__1']);
+    expect(splitOptions.decorationAreas.map((area) => area.label)).toEqual(['Chest', 'Hem']);
+
+    const { prepared } = await uploadArtwork();
+    const actor = actorOf({ ...admin, tenantId: tenant._id });
+    await expect(prepareProductArtworkDesign({
+      ...actor,
+      input: designInput({
+        name: 'Polo mark',
+        catalogProductId: String(polo._id),
+        artworkTicketId: prepared.ticketId,
+        decorationArea: 'front',
+        variant: { sku: 'POLO-BLK-L' },
+      }),
+    })).rejects.toThrow(/use one of: right, left, back/);
+
+    const left = poloOptions.decorationAreas.find((area) => area.key === 'left');
+    const preview = await prepareProductArtworkDesign({
+      ...actor,
+      input: designInput({
+        name: 'Polo mark',
+        catalogProductId: String(polo._id),
+        artworkTicketId: prepared.ticketId,
+        decorationArea: poloOptions.defaultDecorationArea,
+        placement: left.defaultPlacement,
+        variant: { sku: 'POLO-BLK-L', color: 'Black', size: 'L' },
+      }),
+    });
+    expect(preview.preview).toMatchObject({
+      bakedMockup: false,
+      decorationArea: { key: 'left', label: 'Left' },
+      variant: { sku: 'POLO-BLK-L', color: 'Black', size: 'L' },
+    });
+    expect(preview.preview.mockupUrl).toBeUndefined();
+    expect(await Collection.countDocuments({ tenantId: tenant._id })).toBe(0);
+
+    const saved = await executeProductArtworkDesign({
+      ...actor,
+      input: designInput({
+        name: 'Polo mark',
+        catalogProductId: String(polo._id),
+        artworkTicketId: prepared.ticketId,
+        decorationArea: 'left',
+        placement: left.defaultPlacement,
+        variant: { sku: 'POLO-BLK-L', color: 'Black', size: 'L' },
+      }),
+      confirmationId: preview.confirmationId,
+      idempotencyKey: 'polo-left-1',
+    });
+    expect(saved).toMatchObject({
+      status: 'draft',
+      published: false,
+      bakedMockup: false,
+      catalogProductId: String(polo._id),
+      artworkUrl: preview.preview.artworkUrl,
+    });
+    const stored = await Collection.findOne({ _id: saved.id, tenantId: tenant._id });
+    expect(stored.productRefs[0].placements[0].key).toBe('left');
+    expect(stored.productRefs[0].placements[0].artworkUrl).toBe(preview.preview.artworkUrl);
+    expect(stored.productRefs[0].selectedVariant).toMatchObject({
+      sku: 'POLO-BLK-L', color: 'Black', size: 'L', colorHex: '#111111',
+    });
+    expect(stored.productRefs[0].mockupUrl || '').toBe('');
+    expect(stored.status).toBe('draft');
+    expect((await Shop.findOne({ _id: shop._id, tenantId: tenant._id })).activeListingKeys).toEqual(['keep:listing']);
+
+    await expect(prepareProductArtworkDesign({
+      ...actor,
+      input: designInput({
+        name: 'Mug wrap',
+        catalogProductId: String(mug._id),
+        artworkTicketId: prepared.ticketId,
+        decorationArea: 'front',
+        variant: { sku: 'MUG-WHT' },
+      }),
+    })).rejects.toThrow(/use one of: wrap/);
+
+    const wrap = mugOptions.decorationAreas[0];
+    const mugPreview = await prepareProductArtworkDesign({
+      ...actor,
+      input: designInput({
+        name: 'Mug wrap',
+        catalogProductId: String(mug._id),
+        artworkTicketId: prepared.ticketId,
+        decorationArea: wrap.key,
+        placement: wrap.defaultPlacement,
+        variant: { sku: 'MUG-WHT', color: 'White', size: 'OS' },
+      }),
+    });
+    const mugSaved = await executeProductArtworkDesign({
+      ...actor,
+      input: designInput({
+        name: 'Mug wrap',
+        catalogProductId: String(mug._id),
+        artworkTicketId: prepared.ticketId,
+        decorationArea: wrap.key,
+        placement: wrap.defaultPlacement,
+        variant: { sku: 'MUG-WHT', color: 'White', size: 'OS' },
+      }),
+      confirmationId: mugPreview.confirmationId,
+      idempotencyKey: 'mug-wrap-1',
+    });
+    const mugStored = await Collection.findOne({ _id: mugSaved.id, tenantId: tenant._id });
+    expect(mugStored.productRefs[0].placements[0].key).toBe('wrap');
+    expect(mugStored.productRefs[0].selectedVariant.sku).toBe('MUG-WHT');
+
+    const hem = splitOptions.decorationAreas.find((area) => area.key === 'front__1');
+    const hemPreview = await prepareProductArtworkDesign({
+      ...actor,
+      input: designInput({
+        name: 'Tee hem',
+        catalogProductId: String(split._id),
+        artworkTicketId: prepared.ticketId,
+        decorationArea: hem.key,
+        placement: hem.defaultPlacement,
+        variant: undefined,
+      }),
+    });
+    expect(hemPreview.preview.decorationArea).toEqual({ key: 'front__1', label: 'Hem' });
+    expect(hemPreview.preview.bakedMockup).toBe(false);
+  });
+
+  it('stores a renderer image only when the renderer returns a real PNG', async () => {
+    const { prepared, completed } = await uploadArtwork();
+    product.baseImageUrl = completed.assetUrl;
+    product.maskImageUrl = completed.assetUrl;
+    product.printAreas = [{
+      key: 'front',
+      label: 'Front',
+      xIn: 7,
+      yIn: 6,
+      widthIn: 6,
+      heightIn: 6,
+      dpi: 300,
+      methods: ['dtf'],
+    }];
+    product.physicalDimensions = { width: 20, height: 24, length: 18 };
+    await product.save();
+
+    const options = await getProductDesignOptions(String(product._id));
+    const front = options.decorationAreas.find((area) => area.key === 'front');
+    expect(front.rendererCompatible).toBe(true);
+    const actor = actorOf({ ...admin, tenantId: tenant._id });
+    const input = designInput({
+      name: 'Baked front',
+      artworkTicketId: prepared.ticketId,
+      decorationArea: front.key,
+      placement: front.defaultPlacement,
+    });
+
+    const configured = vi.spyOn(swagRenderer, 'rendererConfigured').mockReturnValue(true);
+    const requests = [];
+    const render = vi.spyOn(swagRenderer, 'withSwagRenderer').mockImplementation(async (run) => run({
+      version: 'test-renderer',
+      evaluate: async (_op, args) => {
+        requests.push(args[3]);
+        return { dataUrl: `data:image/png;base64,${ARTWORK_PNG.toString('base64')}` };
+      },
+    }));
+    try {
+      const preview = await prepareProductArtworkDesign({ ...actor, input });
+      expect(requests.at(-1)).toMatchObject({
+        areaKey: 'front',
+        placement: { printWPct: front.defaultPlacement.widthPercent },
+      });
+      expect(preview.preview.bakedMockup).toBe(true);
+      expect(preview.preview.mockupUrl).toMatch(/^\/uploads\//);
+      const previewBytes = await fs.readFile(path.join(apiRoot, preview.preview.mockupUrl.replace(/^\//, '')));
+      expect(Buffer.compare(previewBytes, ARTWORK_PNG)).toBe(0);
+      expect(await Collection.countDocuments({ tenantId: tenant._id })).toBe(0);
+
+      const saved = await executeProductArtworkDesign({
+        ...actor,
+        input,
+        confirmationId: preview.confirmationId,
+        idempotencyKey: 'baked-front-1',
+      });
+      expect(saved.bakedMockup).toBe(true);
+      const stored = await Collection.findOne({ _id: saved.id, tenantId: tenant._id });
+      expect(stored.productRefs[0].mockupUrl).toBe(saved.mockupUrl);
+      expect(stored.productRefs[0].placements[0].key).toBe('front');
+      const savedBytes = await fs.readFile(path.join(apiRoot, stored.productRefs[0].mockupUrl.replace(/^\//, '')));
+      expect(Buffer.compare(savedBytes, ARTWORK_PNG)).toBe(0);
+
+      requests.length = 0;
+      const moved = await prepareProductArtworkDesign({
+        ...actor,
+        input: { ...input, name: 'Moved front', placement: { ...front.defaultPlacement, widthPercent: 40 } },
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0].areaKey).toBe('front');
+      expect(requests[0].placement.printWPct).toBe(40);
+      expect(moved.preview.bakedMockup).toBe(true);
+      expect(moved.preview.mockupUrl).toMatch(/^\/uploads\//);
+
+      render.mockRejectedValue(new Error('renderer down'));
+      const failed = await prepareProductArtworkDesign({
+        ...actor,
+        input: { ...input, name: 'Renderer down' },
+      });
+      expect(failed.preview.bakedMockup).toBe(false);
+      expect(failed.preview.mockupUrl).toBeUndefined();
+    } finally {
+      configured.mockRestore();
+      render.mockRestore();
+    }
   });
 });

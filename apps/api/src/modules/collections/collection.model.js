@@ -10,6 +10,17 @@ const productRefSchema = new mongoose.Schema(
     group: String,
     /** Absent on legacy refs. Modern explicit designs never inherit a shared logo. */
     inheritArtwork: { type: Boolean, default: undefined },
+    /** Variant chosen for this design. Catalog product refs have no other variant field. */
+    selectedVariant: {
+      type: {
+        sku: { type: String, default: '' },
+        color: { type: String, default: '' },
+        size: { type: String, default: '' },
+        colorHex: { type: String, default: '' },
+      },
+      default: undefined,
+      _id: false,
+    },
     /** Pre-baked design mockup (mask + artwork) — served to shop/storefront as-is. */
     mockupUrl: { type: String, default: '' },
     /** Pre-baked back-view design mockup (optional). */
